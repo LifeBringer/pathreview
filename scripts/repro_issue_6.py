@@ -1,26 +1,34 @@
-"""Reproduction for issue #6 — duplicate embeddings on re-ingest.
+"""Reproduction / verification for issue #6 — duplicate embeddings on re-ingest.
 
 Drives the real IngestionPipeline with the app's own components:
 - rag.retriever.vector_store.VectorStore (ChromaDB persistent client)
 - ingestion.embeddings.provider.MockEmbeddingProvider (deterministic, offline)
 - core.database.AsyncSessionLocal (the app's real session factory)
 
+Each part prints a PASS/FAIL verdict, so the same script serves as the
+before-the-fix reproduction (all FAIL) and the after-the-fix verification
+(all PASS).
+
 Run from the repo root:
     .venv/bin/python scripts/repro_issue_6.py
 
-Requires the docker-compose Postgres to be up (only for the session object;
-no rows are read or written — that's part of the bug).
+Requires the docker-compose Postgres to be up and seeded (`make seed`) — the
+profile is looked up from it, and after the fix the dedup rows are written to it.
 """
 
+import asyncio
 import shutil
 
+from sqlalchemy import delete, func, select
+
 from core.database import AsyncSessionLocal
+from core.models.ingested_source import IngestedSource
+from core.models.profile import Profile
 from ingestion.embeddings.provider import MockEmbeddingProvider
 from ingestion.pipeline import IngestionPipeline
 from rag.retriever.vector_store import VectorStore
 
 CHROMA_DIR = "/tmp/repro6_chroma"
-PROFILE = "11111111-1111-1111-1111-111111111111"
 
 README = """# TaskTracker
 
@@ -59,84 +67,138 @@ def github_fetch(stars: int, pushed_at: str) -> dict:
         "language": "Python",
         "languages": {"Python": 6000, "TypeScript": 4000},
         "topics": ["fastapi", "react", "productivity"],
+        "html_url": "https://github.com/example/tasktracker",
         "stargazers_count": stars,  # volatile
         "pushed_at": pushed_at,  # volatile
     }
 
 
-def main() -> None:
+def verdict(ok: bool, message: str) -> bool:
+    print(f"  [{'PASS' if ok else 'FAIL'}] {message}")
+    return ok
+
+
+async def main() -> None:
     shutil.rmtree(CHROMA_DIR, ignore_errors=True)
     store = VectorStore(persist_dir=CHROMA_DIR)
     collection = store.get_collection("portfolio")
     provider = CountingProvider()
-    session = AsyncSessionLocal()  # the app's real session object
-    pipeline = IngestionPipeline(
-        vector_db=collection, db_session=session, embedding_provider=provider
-    )
 
-    print("=" * 72)
-    print("PART A — re-ingest the SAME README (byte-identical content)")
-    print("=" * 72)
-    r1 = pipeline.ingest_readme(PROFILE, "tasktracker", README)
-    print(f"\n  1st ingest: skipped={r1.skipped}  chunk_count={r1.chunk_count}")
-    calls_before = provider.calls
-    r2 = pipeline.ingest_readme(PROFILE, "tasktracker", README)
-    print(f"  2nd ingest: skipped={r2.skipped}  chunk_count={r2.chunk_count}")
-    print(
-        f"  -> expected skipped=True on 2nd call; embedding provider was "
-        f"called {provider.calls - calls_before} more time(s) (re-billed)"
-    )
-    print(
-        f"  -> vector count in Chroma: {collection.count()} "
-        f"(flat only because chunk IDs collide and Chroma drops them)"
-    )
+    async with AsyncSessionLocal() as session:
+        profile_id = (await session.execute(select(Profile.id).limit(1))).scalar_one_or_none()
+        if profile_id is None:
+            raise SystemExit("No profiles in the database. Run `make seed` before this script.")
 
-    print()
-    print("=" * 72)
-    print("PART B — re-ingest the SAME REPO after a routine metadata re-fetch")
-    print("        (star count 41 -> 42; nothing about the code changed)")
-    print("=" * 72)
-    b1 = pipeline.ingest_repo_metadata(PROFILE, github_fetch(41, "2026-07-14T10:00:00Z"))
-    count_after_first = collection.count()
-    b2 = pipeline.ingest_repo_metadata(PROFILE, github_fetch(42, "2026-07-21T09:00:00Z"))
-    count_after_second = collection.count()
-    print(f"\n  1st ingest: skipped={b1.skipped}  source_id={b1.source_id}")
-    print(f"  2nd ingest: skipped={b2.skipped}  source_id={b2.source_id}")
-    print("  -> same repo, two different source_ids (hash covers volatile fields)")
-    print(
-        f"  -> vector count after 1st: {count_after_first}, after 2nd: "
-        f"{count_after_second}  (DUPLICATED)"
-    )
+        # Start from a clean dedup ledger so repeated runs are meaningful.
+        await session.execute(delete(IngestedSource).where(IngestedSource.profile_id == profile_id))
+        await session.commit()
 
-    print()
-    print("=" * 72)
-    print("PART C — what retrieval now sees for a query about this repo")
-    print("=" * 72)
-    query_emb = MockEmbeddingProvider().embed(["python fastapi todo project"])[0]
-    hits = store.query(query_emb, "portfolio", n_results=6)
-    for h in hits:
-        sid = h["metadata"].get("source_id", "?")
-        print(f"  score={h['score']:.4f}  source={sid[:44]:44s}  text={h['text'][:40]!r}")
-    repo_hits = [h for h in hits if h["metadata"].get("source_type") == "repo"]
-    distinct_repo_sources = {h["metadata"]["source_id"] for h in repo_hits}
-    print(
-        f"\n  -> the single repo 'tasktracker' occupies {len(repo_hits)} of the "
-        f"top {len(hits)} hits under {len(distinct_repo_sources)} different "
-        f"source_ids (near-identical text, duplicated)"
-    )
+        pipeline = IngestionPipeline(
+            vector_db=collection, db_session=session, embedding_provider=provider
+        )
+        results = []
 
-    print()
-    print("SUMMARY")
-    print(
-        f"  embed() batches billed : {provider.calls} "
-        f"(texts embedded: {provider.texts_embedded})"
-    )
-    print(f"  chroma vectors stored  : {collection.count()}")
-    print(
-        '  ingested_sources rows  : psql -c "select count(*) from '
-        'ingested_sources;" -> 0 (recording is a placeholder)'
-    )
+        print("=" * 72)
+        print("PART A — re-ingest the SAME README (byte-identical content)")
+        print("=" * 72)
+        r1 = await pipeline.ingest_readme(profile_id, "tasktracker", README)
+        calls_after_first = provider.calls
+        r2 = await pipeline.ingest_readme(profile_id, "tasktracker", README)
+        rebilled = provider.calls - calls_after_first
+        print(f"\n  1st ingest: skipped={r1.skipped}  chunk_count={r1.chunk_count}")
+        print(f"  2nd ingest: skipped={r2.skipped}  chunk_count={r2.chunk_count}")
+        results.append(verdict(r2.skipped, "2nd identical README ingest is skipped"))
+        results.append(verdict(rebilled == 0, f"embedding provider re-billed {rebilled} time(s)"))
+
+        print()
+        print("=" * 72)
+        print("PART B — re-ingest the SAME REPO after a routine metadata re-fetch")
+        print("        (star count 41 -> 42; nothing about the code changed)")
+        print("=" * 72)
+        b1 = await pipeline.ingest_repo_metadata(
+            profile_id, github_fetch(41, "2026-07-14T10:00:00Z")
+        )
+        count_after_first = collection.count()
+        b2 = await pipeline.ingest_repo_metadata(
+            profile_id, github_fetch(42, "2026-07-21T09:00:00Z")
+        )
+        count_after_second = collection.count()
+        print(f"\n  1st ingest: skipped={b1.skipped}  source_id={b1.source_id}")
+        print(f"  2nd ingest: skipped={b2.skipped}  source_id={b2.source_id}")
+        results.append(
+            verdict(
+                b1.source_id == b2.source_id,
+                "same repo keeps one source_id across a volatile-field change",
+            )
+        )
+        results.append(
+            verdict(
+                count_after_first == count_after_second,
+                f"chroma vector count stable ({count_after_first} -> " f"{count_after_second})",
+            )
+        )
+
+        print()
+        print("=" * 72)
+        print("PART C — what retrieval now sees for a query about this repo")
+        print("=" * 72)
+        query_emb = MockEmbeddingProvider().embed(["python fastapi todo project"])[0]
+        hits = store.query(query_emb, "portfolio", n_results=6)
+        for h in hits:
+            sid = h["metadata"].get("source_id", "?")
+            print(f"  score={h['score']:.4f}  source={sid[:44]:44s}  text={h['text'][:40]!r}")
+        repo_hits = [h for h in hits if h["metadata"].get("source_type") == "repo"]
+        distinct = {h["metadata"]["source_id"] for h in repo_hits}
+        print()
+        results.append(
+            verdict(
+                len(distinct) <= 1,
+                f"repo 'tasktracker' appears under {len(distinct)} source_id(s) "
+                f"across {len(repo_hits)} of the top {len(hits)} hits",
+            )
+        )
+
+        print()
+        print("=" * 72)
+        print("PART D — the dedup ledger")
+        print("=" * 72)
+        rows = (
+            (
+                await session.execute(
+                    select(IngestedSource.source_id, IngestedSource.chunk_count).where(
+                        IngestedSource.profile_id == profile_id
+                    )
+                )
+            )
+            .tuples()
+            .all()
+        )
+        total = (
+            await session.execute(
+                select(func.count())
+                .select_from(IngestedSource)
+                .where(IngestedSource.profile_id == profile_id)
+            )
+        ).scalar_one()
+        for source_id, chunk_count in rows:
+            print(f"  {source_id}  chunks={chunk_count}")
+        print()
+        results.append(verdict(total == 2, f"ingested_sources holds {total} row(s), expected 2"))
+
+        print()
+        print("SUMMARY")
+        print(
+            f"  embed() batches billed : {provider.calls} "
+            f"(texts embedded: {provider.texts_embedded})"
+        )
+        print(f"  chroma vectors stored  : {collection.count()}")
+        print(f"  ingested_sources rows  : {total}")
+        print()
+        passed = sum(1 for r in results if r)
+        print(f"  {passed}/{len(results)} checks passed")
+        if passed != len(results):
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
