@@ -7,10 +7,11 @@ while still testing _check_skip and _record_ingested_source together, which is
 where the bug lived — each half was individually broken.
 """
 
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from ingestion.pipeline import IngestionPipeline
 
@@ -42,7 +43,7 @@ Skills: Python, FastAPI, PostgreSQL
 """
 
 
-def repo_payload(**overrides) -> dict:
+def repo_payload(**overrides: Any) -> dict:
     """A GitHub-shaped repo payload; override any field per test."""
     data = {
         "name": "tasktracker",
@@ -72,36 +73,41 @@ class ForeignKeyViolationError(Exception):
     sqlstate = "23503"
 
 
+def db_down() -> OperationalError:
+    """The database being unreachable, as SQLAlchemy surfaces it."""
+    return OperationalError("SELECT 1", {}, ConnectionError("connection reset"))
+
+
 class FakeResult:
-    def __init__(self, row):
+    def __init__(self, row: Any) -> None:
         self._row = row
 
-    def scalar_one_or_none(self):
+    def scalar_one_or_none(self) -> Any:
         return self._row
 
 
 class FakeAsyncSession:
     """Minimal AsyncSession stand-in with a real uniqueness check on source_id."""
 
-    def __init__(self):
-        self.rows = {}
-        self.pending = []
+    def __init__(self) -> None:
+        self.rows: dict[str, Any] = {}
+        self.pending: list[Any] = []
         self.commits = 0
         self.rollbacks = 0
-        self.execute_error = None
-        self.commit_error = None
+        self.execute_error: Exception | None = None
+        self.commit_error: Exception | None = None
 
-    async def execute(self, statement):
+    async def execute(self, statement: Any) -> FakeResult:
         if self.execute_error is not None:
             raise self.execute_error
         params = statement.compile().params
         source_id = next(iter(params.values()))
         return FakeResult(self.rows.get(source_id))
 
-    def add(self, obj):
+    def add(self, obj: Any) -> None:
         self.pending.append(obj)
 
-    async def commit(self):
+    async def commit(self) -> None:
         if self.commit_error is not None:
             self.pending.clear()
             raise self.commit_error
@@ -113,7 +119,7 @@ class FakeAsyncSession:
         self.pending.clear()
         self.commits += 1
 
-    async def rollback(self):
+    async def rollback(self) -> None:
         self.pending.clear()
         self.rollbacks += 1
 
@@ -123,21 +129,23 @@ class TestIngestionIdempotency:
     """Re-ingesting unchanged content must be a recorded no-op (issue #6)."""
 
     @pytest.fixture
-    def session(self):
+    def session(self) -> FakeAsyncSession:
         return FakeAsyncSession()
 
     @pytest.fixture
-    def provider(self):
+    def provider(self) -> Mock:
         provider = Mock()
         provider.embed = Mock(side_effect=lambda texts: [[0.1] * 1536 for _ in texts])
         return provider
 
     @pytest.fixture
-    def vector_db(self):
+    def vector_db(self) -> Mock:
         return Mock()
 
     @pytest.fixture
-    def pipeline(self, vector_db, session, provider):
+    def pipeline(
+        self, vector_db: Mock, session: FakeAsyncSession, provider: Mock
+    ) -> IngestionPipeline:
         return IngestionPipeline(
             vector_db=vector_db, db_session=session, embedding_provider=provider
         )
@@ -145,7 +153,9 @@ class TestIngestionIdempotency:
     # ---- core idempotency ------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_second_identical_readme_ingest_is_skipped(self, pipeline):
+    async def test_second_identical_readme_ingest_is_skipped(
+        self, pipeline: IngestionPipeline
+    ) -> None:
         first = await pipeline.ingest_readme(PROFILE_A, "tasktracker", README)
         second = await pipeline.ingest_readme(PROFILE_A, "tasktracker", README)
 
@@ -156,7 +166,9 @@ class TestIngestionIdempotency:
         assert second.source_id == first.source_id
 
     @pytest.mark.asyncio
-    async def test_skipped_ingest_does_not_re_bill_embedding_provider(self, pipeline, provider):
+    async def test_skipped_ingest_does_not_re_bill_embedding_provider(
+        self, pipeline: IngestionPipeline, provider: Mock
+    ) -> None:
         await pipeline.ingest_readme(PROFILE_A, "tasktracker", README)
         calls_after_first = provider.embed.call_count
 
@@ -166,7 +178,9 @@ class TestIngestionIdempotency:
         assert provider.embed.call_count == calls_after_first
 
     @pytest.mark.asyncio
-    async def test_skipped_ingest_does_not_write_to_vector_store(self, pipeline, vector_db):
+    async def test_skipped_ingest_does_not_write_to_vector_store(
+        self, pipeline: IngestionPipeline, vector_db: Mock
+    ) -> None:
         await pipeline.ingest_readme(PROFILE_A, "tasktracker", README)
         adds_after_first = vector_db.add.call_count
 
@@ -176,7 +190,9 @@ class TestIngestionIdempotency:
         assert vector_db.add.call_count == adds_after_first
 
     @pytest.mark.asyncio
-    async def test_first_ingest_records_exactly_one_row(self, pipeline, session):
+    async def test_first_ingest_records_exactly_one_row(
+        self, pipeline: IngestionPipeline, session: FakeAsyncSession
+    ) -> None:
         result = await pipeline.ingest_readme(PROFILE_A, "tasktracker", README)
         await pipeline.ingest_readme(PROFILE_A, "tasktracker", README)
 
@@ -190,7 +206,7 @@ class TestIngestionIdempotency:
     # ---- repo hash stability --------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_repo_hash_ignores_volatile_fields(self, pipeline):
+    async def test_repo_hash_ignores_volatile_fields(self, pipeline: IngestionPipeline) -> None:
         first = await pipeline.ingest_repo_metadata(PROFILE_A, repo_payload())
         second = await pipeline.ingest_repo_metadata(
             PROFILE_A,
@@ -206,7 +222,7 @@ class TestIngestionIdempotency:
         assert second.skipped is True
 
     @pytest.mark.asyncio
-    async def test_repo_hash_ignores_key_ordering(self, pipeline):
+    async def test_repo_hash_ignores_key_ordering(self, pipeline: IngestionPipeline) -> None:
         forward = repo_payload()
         reordered = dict(reversed(list(forward.items())))
 
@@ -217,7 +233,9 @@ class TestIngestionIdempotency:
         assert second.skipped is True
 
     @pytest.mark.asyncio
-    async def test_repo_hash_reacts_to_description_change(self, pipeline):
+    async def test_repo_hash_reacts_to_description_change(
+        self, pipeline: IngestionPipeline
+    ) -> None:
         first = await pipeline.ingest_repo_metadata(PROFILE_A, repo_payload())
         second = await pipeline.ingest_repo_metadata(
             PROFILE_A, repo_payload(description="Now a Kubernetes operator")
@@ -227,7 +245,7 @@ class TestIngestionIdempotency:
         assert second.skipped is False
 
     @pytest.mark.asyncio
-    async def test_repo_hash_reacts_to_topics_change(self, pipeline):
+    async def test_repo_hash_reacts_to_topics_change(self, pipeline: IngestionPipeline) -> None:
         first = await pipeline.ingest_repo_metadata(PROFILE_A, repo_payload())
         second = await pipeline.ingest_repo_metadata(
             PROFILE_A, repo_payload(topics=["fastapi", "react", "kubernetes"])
@@ -239,7 +257,9 @@ class TestIngestionIdempotency:
     # ---- scoping edge cases ---------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_identical_content_across_profiles_is_not_deduplicated(self, pipeline):
+    async def test_identical_content_across_profiles_is_not_deduplicated(
+        self, pipeline: IngestionPipeline
+    ) -> None:
         first = await pipeline.ingest_readme(PROFILE_A, "tasktracker", README)
         second = await pipeline.ingest_readme(PROFILE_B, "tasktracker", README)
 
@@ -247,7 +267,9 @@ class TestIngestionIdempotency:
         assert second.skipped is False
 
     @pytest.mark.asyncio
-    async def test_same_resume_under_a_different_filename_is_skipped(self, pipeline):
+    async def test_same_resume_under_a_different_filename_is_skipped(
+        self, pipeline: IngestionPipeline
+    ) -> None:
         first = await pipeline.ingest_resume(PROFILE_A, RESUME, "resume.md")
         second = await pipeline.ingest_resume(PROFILE_A, RESUME, "resume-final-v2.md")
 
@@ -255,7 +277,9 @@ class TestIngestionIdempotency:
         assert second.skipped is True
 
     @pytest.mark.asyncio
-    async def test_recorded_row_keeps_the_first_filename(self, pipeline, session):
+    async def test_recorded_row_keeps_the_first_filename(
+        self, pipeline: IngestionPipeline, session: FakeAsyncSession
+    ) -> None:
         first = await pipeline.ingest_resume(PROFILE_A, RESUME, "resume.md")
         await pipeline.ingest_resume(PROFILE_A, RESUME, "resume-final-v2.md")
 
@@ -264,8 +288,10 @@ class TestIngestionIdempotency:
     # ---- failure paths ---------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_skip_check_db_error_proceeds_with_ingestion(self, pipeline, session, provider):
-        session.execute_error = RuntimeError("connection reset")
+    async def test_skip_check_db_error_proceeds_with_ingestion(
+        self, pipeline: IngestionPipeline, session: FakeAsyncSession, provider: Mock
+    ) -> None:
+        session.execute_error = db_down()
 
         result = await pipeline.ingest_readme(PROFILE_A, "tasktracker", README)
 
@@ -274,7 +300,9 @@ class TestIngestionIdempotency:
         assert provider.embed.call_count > 0
 
     @pytest.mark.asyncio
-    async def test_concurrent_record_race_does_not_fail_the_ingest(self, pipeline, session):
+    async def test_concurrent_record_race_does_not_fail_the_ingest(
+        self, pipeline: IngestionPipeline, session: FakeAsyncSession
+    ) -> None:
         # Another worker slipped a row in between our _check_skip and our commit.
         session.commit_error = IntegrityError("INSERT", {}, UniqueViolationError())
 
@@ -285,8 +313,11 @@ class TestIngestionIdempotency:
 
     @pytest.mark.asyncio
     async def test_foreign_key_violation_is_not_treated_as_a_dedup_race(
-        self, pipeline, session, monkeypatch
-    ):
+        self,
+        pipeline: IngestionPipeline,
+        session: FakeAsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         # An unknown profile_id is a real bug and must not be logged as a benign
         # "already recorded by a concurrent ingest". structlog bypasses caplog, so
         # assert against the module logger directly.
@@ -306,7 +337,12 @@ class TestIngestionIdempotency:
         )
 
     @pytest.mark.asyncio
-    async def test_unique_violation_is_logged_as_a_dedup_race(self, pipeline, session, monkeypatch):
+    async def test_unique_violation_is_logged_as_a_dedup_race(
+        self,
+        pipeline: IngestionPipeline,
+        session: FakeAsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         spy = Mock()
         monkeypatch.setattr("ingestion.pipeline.logger", spy)
         session.commit_error = IntegrityError("INSERT", {}, UniqueViolationError())
@@ -320,12 +356,15 @@ class TestIngestionIdempotency:
 
     @pytest.mark.asyncio
     async def test_skip_check_db_error_is_logged_at_error_level(
-        self, pipeline, session, monkeypatch
-    ):
+        self,
+        pipeline: IngestionPipeline,
+        session: FakeAsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         # The original bug hid behind a warning nobody reads.
         spy = Mock()
         monkeypatch.setattr("ingestion.pipeline.logger", spy)
-        session.execute_error = RuntimeError("connection reset")
+        session.execute_error = db_down()
 
         await pipeline.ingest_readme(PROFILE_A, "tasktracker", README)
 
@@ -335,10 +374,25 @@ class TestIngestionIdempotency:
         assert spy.warning.call_args_list == []
 
     @pytest.mark.asyncio
-    async def test_failed_recording_leaves_the_source_unskipped(self, pipeline, session):
+    async def test_programming_error_in_skip_check_is_not_swallowed(
+        self, pipeline: IngestionPipeline, session: FakeAsyncSession
+    ) -> None:
+        # Regression guard for the root cause of issue #6: the broken query was an
+        # AttributeError hidden by a bare `except Exception`, which silently turned
+        # deduplication off. Only database errors are tolerated; anything else must
+        # surface rather than degrade the pipeline to its old no-op behavior.
+        session.execute_error = AttributeError("'AsyncSession' object has no attribute 'query'")
+
+        with pytest.raises(AttributeError):
+            await pipeline.ingest_readme(PROFILE_A, "tasktracker", README)
+
+    @pytest.mark.asyncio
+    async def test_failed_recording_leaves_the_source_unskipped(
+        self, pipeline: IngestionPipeline, session: FakeAsyncSession
+    ) -> None:
         # If recording fails, the next ingest must retry rather than skip on a
         # row that was never persisted.
-        session.commit_error = RuntimeError("disk full")
+        session.commit_error = db_down()
         first = await pipeline.ingest_readme(PROFILE_A, "tasktracker", README)
 
         session.commit_error = None
@@ -349,7 +403,9 @@ class TestIngestionIdempotency:
         assert list(session.rows) == [second.source_id]
 
     @pytest.mark.asyncio
-    async def test_empty_content_is_still_recorded_so_re_upload_skips(self, pipeline, session):
+    async def test_empty_content_is_still_recorded_so_re_upload_skips(
+        self, pipeline: IngestionPipeline, session: FakeAsyncSession
+    ) -> None:
         first = await pipeline.ingest_resume(PROFILE_A, "   ", "empty.md")
         second = await pipeline.ingest_resume(PROFILE_A, "   ", "empty.md")
 

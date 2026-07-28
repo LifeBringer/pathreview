@@ -8,6 +8,9 @@ unique constraint from migration 003, and a genuine vector store.
 Requires the compose stack: `make run` / `docker compose up -d db`.
 """
 
+from collections.abc import AsyncGenerator
+from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -65,7 +68,7 @@ class CountingProvider(MockEmbeddingProvider):
 
 
 @pytest_asyncio.fixture
-async def db_session():
+async def db_session() -> AsyncGenerator[AsyncSession, None]:
     """A session on an engine scoped to this test's event loop.
 
     core.database's module-level engine pools connections against whichever loop
@@ -81,7 +84,7 @@ async def db_session():
 
 
 @pytest_asyncio.fixture
-async def profile_id(db_session):
+async def profile_id(db_session: AsyncSession) -> AsyncGenerator[str, None]:
     """Create a throwaway user + profile, and clean up everything after."""
     # Hold the IDs as plain strings: a test that rolls back expires its ORM
     # objects, and re-reading user.id during teardown would attempt IO outside
@@ -106,38 +109,45 @@ async def profile_id(db_session):
 
 
 @pytest.fixture
-def collection(tmp_path):
+def collection(tmp_path: Path) -> Any:
     store = VectorStore(persist_dir=str(tmp_path / "chroma"))
     return store.get_collection("portfolio")
 
 
 @pytest.fixture
-def pipeline(collection, db_session, provider):
+def pipeline(
+    collection: Any, db_session: AsyncSession, provider: CountingProvider
+) -> IngestionPipeline:
     return IngestionPipeline(
         vector_db=collection, db_session=db_session, embedding_provider=provider
     )
 
 
 @pytest.fixture
-def provider():
+def provider() -> CountingProvider:
     return CountingProvider()
 
 
-async def count_rows(session, profile_id) -> int:
-    return (
+async def count_rows(session: AsyncSession, profile_id: str) -> int:
+    result = (
         await session.execute(
             select(func.count())
             .select_from(IngestedSource)
             .where(IngestedSource.profile_id == profile_id)
         )
     ).scalar_one()
+    return int(result)
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_reingesting_identical_readme_is_a_recorded_noop(
-    pipeline, db_session, profile_id, collection, provider
-):
+    pipeline: IngestionPipeline,
+    db_session: AsyncSession,
+    profile_id: str,
+    collection: Any,
+    provider: CountingProvider,
+) -> None:
     first = await pipeline.ingest_readme(profile_id, "tasktracker", README)
     vectors_after_first = collection.count()
     calls_after_first = provider.calls
@@ -155,8 +165,8 @@ async def test_reingesting_identical_readme_is_a_recorded_noop(
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_reingesting_repo_after_star_change_is_skipped(
-    pipeline, db_session, profile_id, collection
-):
+    pipeline: IngestionPipeline, db_session: AsyncSession, profile_id: str, collection: Any
+) -> None:
     first = await pipeline.ingest_repo_metadata(
         profile_id, repo_payload(41, "2026-07-14T10:00:00Z")
     )
@@ -174,7 +184,9 @@ async def test_reingesting_repo_after_star_change_is_skipped(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_recorded_row_carries_the_dedup_key_and_full_hash(pipeline, db_session, profile_id):
+async def test_recorded_row_carries_the_dedup_key_and_full_hash(
+    pipeline: IngestionPipeline, db_session: AsyncSession, profile_id: str
+) -> None:
     result = await pipeline.ingest_readme(profile_id, "tasktracker", README)
 
     row = (
@@ -191,7 +203,9 @@ async def test_recorded_row_carries_the_dedup_key_and_full_hash(pipeline, db_ses
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_unique_constraint_rejects_a_duplicate_source_id(pipeline, db_session, profile_id):
+async def test_unique_constraint_rejects_a_duplicate_source_id(
+    pipeline: IngestionPipeline, db_session: AsyncSession, profile_id: str
+) -> None:
     """Migration 003's constraint is what makes the concurrent-ingest race safe."""
     from sqlalchemy.exc import IntegrityError
 

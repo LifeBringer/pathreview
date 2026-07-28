@@ -5,7 +5,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.models.ingested_source import IngestedSource
@@ -378,6 +378,13 @@ class IngestionPipeline:
         On database failure we proceed with ingestion — availability beats
         deduplication — but log at error level so the failure is visible rather
         than silently disabling the skip check.
+
+        Only SQLAlchemyError is caught, deliberately. The original bug was an
+        AttributeError (calling the sync .query() API on an AsyncSession) that a
+        bare `except Exception` swallowed, turning a broken query into a silent
+        no-op. Narrowing to database errors means an unavailable database still
+        degrades gracefully, while a programming error in this query fails loudly
+        instead of quietly re-introducing issue #6.
         """
         try:
             result = await self.db_session.execute(
@@ -397,7 +404,7 @@ class IngestionPipeline:
                     skipped=True,
                     skip_reason="Source already ingested",
                 )
-        except Exception as e:
+        except SQLAlchemyError as e:
             logger.error(
                 "Could not check if source already ingested; proceeding with ingestion",
                 source_id=source_id,
@@ -468,7 +475,7 @@ class IngestionPipeline:
                     source_id=source_id,
                     error=str(e),
                 )
-        except Exception as e:
+        except SQLAlchemyError as e:
             await self.db_session.rollback()
             logger.error(
                 "Failed to record ingested source",
