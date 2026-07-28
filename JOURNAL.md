@@ -28,3 +28,21 @@ PathReview's ingestion pipeline (`ingestion/pipeline.py`) is supposed to skip so
 **Part 4 — Scope and time.** The issue lists no blockers and depends on no other open issue; because the pipeline has no production caller yet, the regression risk to other flows is low. Two other students have claimed it in the comments — claims are non-exclusive in this course and it's still among the least-crowded viable issues on the tracker (most Tier 1s have 5–14 claims), so I'm fine sharing it. Effort-wise the issue says 4–6 hours; I estimate ~6–8 including the migration, hash normalization, and tests, which fits the Week 8–9 window comfortably alongside my other commitments.
 
 **Setup notes.** Environment note for anyone else on Apple Silicon without Docker Desktop: I ran the compose stack under Podman. The `chromadb/chroma:0.4.22` arm64 image crashes on boot (`AttributeError: np.float_ was removed in NumPy 2.0`) — I patched `chromadb/api/types.py` inside the image (`np.float_` → `np.float64`) and re-committed it under the same tag rather than touching `docker-compose.yml`. After that, `make setup` + `make run` work as documented and the app loads at localhost:5173.
+
+## Week 8 — Reproduction & solution planning
+
+**Reproduction commit link:** https://github.com/LifeBringer/pathreview/commit/465d7cff1d4315799d880278cad431ee122c50ef
+
+**Reproduction summary:**
+I wrote `scripts/repro_issue_6.py`, which drives the real `IngestionPipeline` (app's own `VectorStore`, `MockEmbeddingProvider`, and `AsyncSessionLocal`) through two scenarios: a byte-identical README ingested twice returns `skipped=False` both times and re-bills the embedding provider (the skip-check fails on every call — `'AsyncSession' object has no attribute 'query'` — and is swallowed to a warning), and the same repo re-fetched with only a star-count change gets a brand-new `source_id`, growing the Chroma collection from 4 to 5 vectors so a retrieval query returns the same repo text in 2 of the top 5 hits. After all four ingests, `ingested_sources` still has 0 rows — the recording method is a placeholder that only logs.
+
+**PLAN.md link:** https://github.com/LifeBringer/pathreview/blob/fix/6-duplicate-embeddings-reingest/PLAN.md
+
+**Walkthrough video (recommended):** _To be added if recorded — optional, not graded._
+
+**Blockers or open questions:**
+The sync/async session mismatch I flagged as the main open decision is now resolved. `grep -rn "IngestionPipeline" --include='*.py' . --exclude-dir=.venv` returns exactly three sites: the class definition itself (`ingestion/pipeline.py:27`) and the import plus instantiation in my own reproduction script (`scripts/repro_issue_6.py:19,73`). No route, service, or existing test constructs the pipeline, and `core/database.py` exposes only the async `AsyncSessionLocal`, so converting the three `ingest_*` methods to `async def` breaks exactly one caller — mine, which I'll update in the same commit.
+
+One new question surfaced while checking what the repo hash should cover. `RepoAnalyzer.parse()` bakes volatile stats directly into the text it hands to the embedder (`ingestion/parsers/repo_analyzer.py:78-80` emit `Stars:`, `Forks:`, and `Open Issues:`), while `topics` and the `languages` dict never reach that text at all. So hashing only stable identity fields — which is the fix the issue asks for — means a star-count change is correctly skipped but leaves the previously stored chunk carrying a stale star count. I'm keeping the narrow hash, because dedup is the point of the issue and stat freshness is really a re-ingestion-policy question adjacent to #27, and I'll call the tradeoff out explicitly in the PR rather than quietly widening scope.
+
+Baseline note for Week 9: `pytest tests/unit -m unit` is already red on untouched upstream code — 53 failed, 375 passed — because this repo seeds 130 issues. None of the failures touch pipeline dedup (the one in `test_batch_processor.py` is a structlog-vs-`caplog` capture mismatch, a different seeded bug). My fix should leave that count at 53, not turn the suite green.
