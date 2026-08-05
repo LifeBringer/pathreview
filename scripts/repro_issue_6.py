@@ -5,9 +5,9 @@ Drives the real IngestionPipeline with the app's own components:
 - ingestion.embeddings.provider.MockEmbeddingProvider (deterministic, offline)
 - core.database.AsyncSessionLocal (the app's real session factory)
 
-Each part prints a PASS/FAIL verdict, so the same script serves as the
-before-the-fix reproduction (all FAIL) and the after-the-fix verification
-(all PASS).
+Each part prints a PASS/FAIL verdict, so the same script serves as both the
+before-the-fix reproduction (4 of the 6 checks fail) and the after-the-fix
+verification (6/6 pass). Exits non-zero if any check fails.
 
 Run from the repo root:
     .venv/bin/python scripts/repro_issue_6.py

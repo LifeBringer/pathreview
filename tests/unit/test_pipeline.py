@@ -374,7 +374,7 @@ class TestIngestionIdempotency:
         assert spy.warning.call_args_list == []
 
     @pytest.mark.asyncio
-    async def test_programming_error_in_skip_check_is_not_swallowed(
+    async def test_attribute_error_in_skip_check_is_not_swallowed(
         self, pipeline: IngestionPipeline, session: FakeAsyncSession
     ) -> None:
         # Regression guard for the root cause of issue #6: the broken query was an
